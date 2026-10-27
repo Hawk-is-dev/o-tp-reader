@@ -1,2 +1,3 @@
 aiogram==3.*
 telethon==1.*
+telegram-session-converter

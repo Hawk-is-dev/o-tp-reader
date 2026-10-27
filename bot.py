@@ -14,7 +14,7 @@ from telethon import TelegramClient
 from telethon.sessions import StringSession
 
 from config import BOT_TOKEN, OWNER_ID, API_ID, API_HASH
-from session_utils import session_string_from_telethon_file, extract_zip_sessions
+from session_utils import session_string_from_file, session_string_from_pyrogram_string, extract_zip_sessions
 
 logging.basicConfig(level=logging.INFO)
 
@@ -73,6 +73,27 @@ async def login_and_get_phone(session_string: str):
         await client.disconnect()
 
 
+async def resolve_and_login_text(raw_text: str, work_dir: str):
+    """Tries the pasted text as a Telethon session string first. If login
+    fails (e.g. it was actually a Pyrogram string and Telethon can't make
+    sense of the bytes), automatically converts it as Pyrogram and retries.
+    Returns (session_string, phone, error)."""
+    phone, error = await login_and_get_phone(raw_text)
+    if not error:
+        return raw_text, phone, None
+
+    # Fallback: maybe this was a Pyrogram string, not Telethon.
+    try:
+        converted = session_string_from_pyrogram_string(raw_text, work_dir)
+    except Exception as conv_err:
+        return None, None, f"Not a valid Telethon session ({error}). Tried as Pyrogram too: {conv_err}"
+
+    phone2, error2 = await login_and_get_phone(converted)
+    if error2:
+        return None, None, f"Converted from Pyrogram format but still couldn't log in: {error2}"
+    return converted, phone2, None
+
+
 # ---------------------------------------------------------------------------
 # /start
 # ---------------------------------------------------------------------------
@@ -110,12 +131,13 @@ async def prompt_send_session(callback: types.CallbackQuery):
 async def handle_session_text(message: types.Message):
     if not is_owner(message.from_user.id):
         return
-    session_string = message.text.strip()
-    if len(session_string) < 20:
+    raw_text = message.text.strip()
+    if len(raw_text) < 20:
         return  # clearly not a session string, ignore quietly
 
     status = await message.answer("🔍 Logging in, please wait...")
-    phone, error = await login_and_get_phone(session_string)
+    work_dir = tempfile.mkdtemp(prefix="otp_session_")
+    session_string, phone, error = await resolve_and_login_text(raw_text, work_dir)
     if error:
         await status.edit_text(f"❌ Could not log in with this session.\n\nReason: {error}")
         return
@@ -153,7 +175,7 @@ async def handle_session_document(message: types.Message):
     if file_name.lower().endswith(".session"):
         status = await message.answer("🔍 Reading session file, please wait...")
         try:
-            session_string = session_string_from_telethon_file(local_path)
+            session_string = session_string_from_file(local_path, work_dir)
         except Exception as e:
             await status.edit_text(f"❌ Session invalid.\n\nReason: {e}")
             return

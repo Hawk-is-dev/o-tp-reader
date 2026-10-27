@@ -3,20 +3,26 @@ Session reading helpers.
 
 Supports:
   - Telethon session STRING (pasted as text)
+  - Pyrogram session STRING (pasted as text) — auto-detected and converted
   - Telethon .session FILE (SQLite) — read via raw SQL instead of Telethon's
     own SQLiteSession loader, which can crash with "too many values to
     unpack" when the file was saved by a different Telethon schema version
     than the one installed here. Reading dc_id/server_address/port/auth_key
     directly and building a fresh StringSession avoids that entirely.
-  - .zip containing one or more .session files
+  - Pyrogram .session FILE — converted to a Telethon session via
+    `telegram-session-converter`
+  - .zip containing a mix of Telethon/Pyrogram .session files
 
-Pyrogram strings/files and tdata folders are intentionally NOT handled here
-(out of scope for this bot) — a zip entry in an unsupported format is simply
-reported as invalid/skipped rather than crashing the batch.
+Needs: pip install telegram-session-converter --break-system-packages
+(Telethon-only string/.session input still works without it; Pyrogram
+input will raise a clear "not installed" error instead of crashing.)
+
+tdata folders are intentionally not handled here (out of scope for this bot).
 """
 
 import os
 import sqlite3
+import uuid
 import zipfile
 
 from telethon.sessions import StringSession
@@ -72,6 +78,46 @@ def session_string_from_telethon_file(path: str) -> str:
     return session.save()
 
 
+def _get_session_manager():
+    try:
+        from session_converter import SessionManager
+    except ImportError:
+        raise RuntimeError(
+            "Pyrogram session support is not installed on this server "
+            "(pip install telegram-session-converter --break-system-packages)."
+        )
+    return SessionManager
+
+
+def session_string_from_pyrogram_string(pyrogram_string: str, work_dir: str) -> str:
+    """Converts a Pyrogram session string into a Telethon session string."""
+    SessionManager = _get_session_manager()
+    sm = SessionManager.from_pyrogram_string_session(pyrogram_string)
+    out_path = os.path.join(work_dir, f"converted_{uuid.uuid4().hex}.session")
+    sm.telethon_file(out_path)
+    return session_string_from_telethon_file(out_path)
+
+
+def session_string_from_pyrogram_file(path: str, work_dir: str) -> str:
+    """Converts a Pyrogram .session file into a Telethon session string."""
+    SessionManager = _get_session_manager()
+    sm = SessionManager.from_pyrogram_session_file(path)
+    out_path = os.path.join(work_dir, f"converted_{uuid.uuid4().hex}.session")
+    sm.telethon_file(out_path)
+    return session_string_from_telethon_file(out_path)
+
+
+def session_string_from_file(path: str, work_dir: str) -> str:
+    """Auto-detects a .session file's format (Telethon or Pyrogram) and
+    returns a Telethon session string either way."""
+    kind = _sqlite_session_kind(path)
+    if kind == "telethon":
+        return session_string_from_telethon_file(path)
+    if kind == "pyrogram":
+        return session_string_from_pyrogram_file(path, work_dir)
+    raise ValueError("Unrecognized .session file format.")
+
+
 def extract_zip_sessions(zip_path: str, work_dir: str):
     """Extracts a .zip and returns a list of dicts, one per .session file found:
         {"name": filename, "session": str | None, "error": str | None}
@@ -92,16 +138,10 @@ def extract_zip_sessions(zip_path: str, work_dir: str):
     results = []
     for sf in session_files:
         name = os.path.basename(sf)
-        kind = _sqlite_session_kind(sf)
-        if kind == "telethon":
-            try:
-                sess_str = session_string_from_telethon_file(sf)
-                results.append({"name": name, "session": sess_str, "error": None})
-            except Exception as e:
-                results.append({"name": name, "session": None, "error": str(e)})
-        elif kind == "pyrogram":
-            results.append({"name": name, "session": None, "error": "Pyrogram .session files aren't supported in this bot."})
-        else:
-            results.append({"name": name, "session": None, "error": "Unrecognized .session file format."})
+        try:
+            sess_str = session_string_from_file(sf, work_dir)
+            results.append({"name": name, "session": sess_str, "error": None})
+        except Exception as e:
+            results.append({"name": name, "session": None, "error": str(e)})
 
     return results
