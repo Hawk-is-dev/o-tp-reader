@@ -75,3 +75,61 @@ def get_all_pending() -> dict:
 def get_pending(entry_id: str):
     with _lock:
         return _load().get(entry_id)
+
+
+# ---------------------------------------------------------------------------
+# Watchman — persistent store for accounts under active login-monitoring.
+# Separate file from the reset store, same pattern.
+# ---------------------------------------------------------------------------
+
+WATCHMAN_STORE_PATH = os.getenv("WATCHMAN_STORE_PATH", "watchmen.json")
+_watchman_lock = threading.Lock()
+
+
+def _load_watchmen() -> dict:
+    if not os.path.exists(WATCHMAN_STORE_PATH):
+        return {}
+    try:
+        with open(WATCHMAN_STORE_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_watchmen(data: dict) -> None:
+    tmp_path = WATCHMAN_STORE_PATH + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, WATCHMAN_STORE_PATH)
+
+
+def add_watchman(entry_id: str, phone: str, session: str, known_hashes: list) -> None:
+    with _watchman_lock:
+        data = _load_watchmen()
+        data[entry_id] = {"phone": phone, "session": session, "known_hashes": known_hashes}
+        _save_watchmen(data)
+
+
+def update_watchman_known_hashes(entry_id: str, known_hashes: list) -> None:
+    with _watchman_lock:
+        data = _load_watchmen()
+        if entry_id in data:
+            data[entry_id]["known_hashes"] = known_hashes
+            _save_watchmen(data)
+
+
+def remove_watchman(entry_id: str) -> None:
+    with _watchman_lock:
+        data = _load_watchmen()
+        data.pop(entry_id, None)
+        _save_watchmen(data)
+
+
+def get_all_watchmen() -> dict:
+    with _watchman_lock:
+        return _load_watchmen()
+
+
+def get_watchman(entry_id: str):
+    with _watchman_lock:
+        return _load_watchmen().get(entry_id)
