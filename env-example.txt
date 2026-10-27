@@ -1,3 +1,0 @@
-BOT_TOKEN=123456:your-bot-token-from-botfather
-API_ID=123456
-API_HASH=your_api_hash_from_my.telegram.org
