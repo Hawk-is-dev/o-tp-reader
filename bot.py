@@ -8,8 +8,10 @@ import uuid
 from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from telethon import TelegramClient, events
@@ -18,7 +20,10 @@ from telethon.tl.functions.account import (
     ResetPasswordRequest,
     GetAuthorizationsRequest,
     ResetAuthorizationRequest,
+    SendVerifyEmailCodeRequest,
+    VerifyEmailRequest,
 )
+from telethon.tl.types import EmailVerifyPurposeLoginChange, EmailVerificationCode
 from telethon.tl.types.account import ResetPasswordOk, ResetPasswordFailedWait, ResetPasswordRequestedWait
 
 import storage
@@ -35,9 +40,18 @@ dp = Dispatcher(storage=MemoryStorage())
 ACCOUNTS = {}
 
 # Which entry point ("📤 Read OTP" / "🔓 Password Reset" / "🔍 Check Sessions" /
-# "👁️ Watchman") the NEXT session upload belongs to. Set only by tapping one
-# of those buttons — single-owner bot, so a plain global is enough, no FSM.
-CURRENT_MODE = "otp"  # "otp" | "reset" | "sessions" | "watchman"
+# "👁️ Watchman" / "✉️ Change Email") the NEXT session upload belongs to. Set
+# only by tapping one of those buttons — single-owner bot, so a plain global
+# is enough, no FSM needed just for routing the upload itself.
+CURRENT_MODE = "otp"  # "otp" | "reset" | "sessions" | "watchman" | "email"
+
+
+class EmailChangeState(StatesGroup):
+    """Change Email needs an ordered back-and-forth (new email, then the
+    code sent to it), so — unlike every other feature here — it uses real
+    FSM state instead of a one-shot button."""
+    waiting_for_new_email = State()
+    waiting_for_code = State()
 
 # Live Watchman clients: entry_id -> {"client": TelegramClient, "burst_task": asyncio.Task | None}
 # Lost on restart — reconnected from storage.get_all_watchmen() in main().
@@ -173,14 +187,16 @@ async def resolve_and_login_text(raw_text: str, work_dir: str):
 # ---------------------------------------------------------------------------
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return
+    await state.clear()  # /start always resets a stuck Change Email flow too
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📤 Read OTP", callback_data="mode_otp")],
         [InlineKeyboardButton(text="🔓 Password Reset", callback_data="mode_reset")],
         [InlineKeyboardButton(text="🔍 Check Sessions", callback_data="mode_sessions")],
         [InlineKeyboardButton(text="👁️ Watchman", callback_data="mode_watchman")],
+        [InlineKeyboardButton(text="✉️ Change Email", callback_data="mode_email")],
     ])
     await message.answer(
         "👋 Welcome!\n\n"
@@ -193,42 +209,57 @@ async def cmd_start(message: types.Message):
 
 
 @dp.callback_query(F.data == "mode_otp")
-async def set_mode_otp(callback: types.CallbackQuery):
+async def set_mode_otp(callback: types.CallbackQuery, state: FSMContext):
     if not is_owner(callback.from_user.id):
         return
     global CURRENT_MODE
     CURRENT_MODE = "otp"
+    await state.clear()  # in case an in-progress Change Email flow was abandoned
     await callback.message.edit_text("📤 Send the session now — as text, a .session file, or a .zip. I'll read the OTP for it on demand.")
     await callback.answer()
 
 
 @dp.callback_query(F.data == "mode_reset")
-async def set_mode_reset(callback: types.CallbackQuery):
+async def set_mode_reset(callback: types.CallbackQuery, state: FSMContext):
     if not is_owner(callback.from_user.id):
         return
     global CURRENT_MODE
     CURRENT_MODE = "reset"
+    await state.clear()
     await callback.message.edit_text("🔓 Send the session now — as text, a .session file, or a .zip. I'll request a 2-Step password reset for it.")
     await callback.answer()
 
 
 @dp.callback_query(F.data == "mode_sessions")
-async def set_mode_sessions(callback: types.CallbackQuery):
+async def set_mode_sessions(callback: types.CallbackQuery, state: FSMContext):
     if not is_owner(callback.from_user.id):
         return
     global CURRENT_MODE
     CURRENT_MODE = "sessions"
+    await state.clear()
     await callback.message.edit_text("🔍 Send the session now — as text, a .session file, or a .zip. I'll show its number, user ID, username and logged-in devices.")
     await callback.answer()
 
 
 @dp.callback_query(F.data == "mode_watchman")
-async def set_mode_watchman(callback: types.CallbackQuery):
+async def set_mode_watchman(callback: types.CallbackQuery, state: FSMContext):
     if not is_owner(callback.from_user.id):
         return
     global CURRENT_MODE
     CURRENT_MODE = "watchman"
+    await state.clear()
     await callback.message.edit_text("👁️ Send the session now — as text, a .session file, or a .zip. I'll watch it and auto-terminate any new login that isn't from your trusted device.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "mode_email")
+async def set_mode_email(callback: types.CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        return
+    global CURRENT_MODE
+    CURRENT_MODE = "email"
+    await state.clear()  # starting fresh — drop any half-finished email change
+    await callback.message.edit_text("✉️ Send the session now — as text or a .session file only (no .zip for this one). I'll walk you through changing the login email.")
     await callback.answer()
 
 
@@ -236,7 +267,7 @@ async def set_mode_watchman(callback: types.CallbackQuery):
 # Single session string
 # ---------------------------------------------------------------------------
 
-async def process_single_session(message: types.Message, session_string: str, profile: dict, status: types.Message):
+async def process_single_session(message: types.Message, session_string: str, profile: dict, status: types.Message, state: FSMContext):
     """Shared final step once a single session is logged in — branches on
     CURRENT_MODE to send the right follow-up for whichever button started
     this upload."""
@@ -259,6 +290,12 @@ async def process_single_session(message: types.Message, session_string: str, pr
             [InlineKeyboardButton(text="📋 Logged Sessions", callback_data=f"logsess_{account_id}")]
         ])
         await status.edit_text(text, parse_mode="Markdown", reply_markup=kb)
+        return
+
+    if CURRENT_MODE == "email":
+        await status.edit_text(f"✅ Logged in — `{phone}`\n\n✉️ Send the new email address:", parse_mode="Markdown")
+        await state.update_data(email_change_session=session_string, email_change_phone=phone)
+        await state.set_state(EmailChangeState.waiting_for_new_email)
         return
 
     if CURRENT_MODE == "watchman":
@@ -285,8 +322,12 @@ async def process_single_session(message: types.Message, session_string: str, pr
     )
 
 
-@dp.message(F.text & ~F.text.startswith("/"))
-async def handle_session_text(message: types.Message):
+# StateFilter(None) is important here: without it, this catch-all text
+# handler would intercept the new-email / code replies that are meant for
+# the Change Email FSM states below, since it has no state restriction of
+# its own and aiogram matches handlers in registration order.
+@dp.message(F.text & ~F.text.startswith("/"), StateFilter(None))
+async def handle_session_text(message: types.Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return
     raw_text = message.text.strip()
@@ -300,7 +341,7 @@ async def handle_session_text(message: types.Message):
         await status.edit_text(f"❌ Could not log in with this session.\n\nReason: {error}")
         return
 
-    await process_single_session(message, session_string, profile, status)
+    await process_single_session(message, session_string, profile, status, state)
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +349,7 @@ async def handle_session_text(message: types.Message):
 # ---------------------------------------------------------------------------
 
 @dp.message(F.document)
-async def handle_session_document(message: types.Message):
+async def handle_session_document(message: types.Message, state: FSMContext):
     if not is_owner(message.from_user.id):
         return
 
@@ -321,6 +362,9 @@ async def handle_session_document(message: types.Message):
     await bot.download_file(tg_file.file_path, local_path)
 
     if file_name.lower().endswith(".zip"):
+        if CURRENT_MODE == "email":
+            await message.answer("❌ Change Email doesn't accept a .zip — send a session string or a single .session file.")
+            return
         await handle_zip_upload(message, local_path, work_dir)
         return
 
@@ -337,7 +381,7 @@ async def handle_session_document(message: types.Message):
             await status.edit_text(f"❌ Could not log in with this session.\n\nReason: {error}")
             return
 
-        await process_single_session(message, session_string, profile, status)
+        await process_single_session(message, session_string, profile, status, state)
         return
 
     await message.answer("❌ Unsupported file type. Send a session string, a .session file, or a .zip.")
@@ -921,6 +965,75 @@ async def restore_watchmen() -> None:
             WATCHMEN_CLIENTS[entry_id] = {"client": client, "burst_task": None}
         except Exception:
             logging.exception(f"Could not restore Watchman {entry_id} ({entry.get('phone')})")
+
+
+# ---------------------------------------------------------------------------
+# Change Email — Telegram's "Login Email" setting (Settings > Privacy &
+# Security > Login Email > Change Email), done through the session directly.
+# ---------------------------------------------------------------------------
+
+@dp.message(EmailChangeState.waiting_for_new_email)
+async def email_change_get_new_email(message: types.Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    new_email = (message.text or "").strip()
+    if "@" not in new_email or "." not in new_email.split("@")[-1]:
+        await message.answer("❌ That doesn't look like a valid email address. Send it again:")
+        return
+
+    data = await state.get_data()
+    session_string = data.get("email_change_session")
+    phone = data.get("email_change_phone")
+
+    status = await message.answer("🔍 Sending a verification code to that email...")
+    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    try:
+        await client.connect()
+        sent = await client(SendVerifyEmailCodeRequest(purpose=EmailVerifyPurposeLoginChange(), email=new_email))
+    except Exception as e:
+        await status.edit_text(f"❌ Could not send a verification code to that email.\n\nReason: {e}")
+        await state.clear()
+        return
+    finally:
+        await client.disconnect()
+
+    await state.update_data(email_change_new_email=new_email)
+    await state.set_state(EmailChangeState.waiting_for_code)
+
+    pattern = getattr(sent, "email_pattern", None) or new_email
+    await status.edit_text(
+        f"📧 Code sent to `{pattern}` for `{phone}`.\n\nSend the code you received:",
+        parse_mode="Markdown"
+    )
+
+
+@dp.message(EmailChangeState.waiting_for_code)
+async def email_change_get_code(message: types.Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    code = (message.text or "").strip()
+
+    data = await state.get_data()
+    session_string = data.get("email_change_session")
+    phone = data.get("email_change_phone")
+    new_email = data.get("email_change_new_email")
+
+    status = await message.answer("🔍 Verifying the code...")
+    client = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    try:
+        await client.connect()
+        await client(VerifyEmailRequest(purpose=EmailVerifyPurposeLoginChange(), verification=EmailVerificationCode(code=code)))
+    except Exception as e:
+        await status.edit_text(f"❌ Could not verify that code.\n\nReason: {e}\n\nSend the code again, or /start to begin over.")
+        return
+    finally:
+        await client.disconnect()
+
+    await state.clear()
+    await status.edit_text(
+        f"✅ Login email changed successfully for `{phone}`!\n\nNew email: `{new_email}`",
+        parse_mode="Markdown"
+    )
 
 
 async def main():
