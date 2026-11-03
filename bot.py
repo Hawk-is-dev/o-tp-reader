@@ -1044,4 +1044,6 @@ async def main():
 
 
 if __name__ == "__main__":
+    from keepalive import keep_alive
+    keep_alive()
     asyncio.run(main())
