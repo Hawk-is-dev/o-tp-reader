@@ -1,0 +1,72 @@
+# Save as: .github/workflows/unzip.yml
+# Upload any .zip to the repo root -> it gets extracted automatically,
+# files are committed, and the zip is removed.
+name: Auto Unzip
+
+on:
+  push:
+    paths:
+      - "*.zip"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  unzip:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract zip files
+        run: |
+          set -e
+          shopt -s nullglob
+          zips=(./*.zip)
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "No zip files found."
+            exit 0
+          fi
+
+          for z in "${zips[@]}"; do
+            echo "Extracting: $z"
+            tmp=$(mktemp -d)
+            unzip -q -o "$z" -d "$tmp"
+            rm -rf "$tmp/__MACOSX"
+
+            # If the zip has a single top-level folder, use its contents
+            count=$(ls -A "$tmp" | wc -l)
+            first="$tmp/$(ls -A "$tmp" | head -n 1)"
+            if [ "$count" -eq 1 ] && [ -d "$first" ]; then
+              src="$first"
+            else
+              src="$tmp"
+            fi
+
+            cp -a "$src"/. .
+            rm -f "$z"
+            rm -rf "$tmp"
+          done
+
+      - name: Remove secrets and junk
+        run: |
+          rm -f .env
+          find . -name "__pycache__" -type d -prune -exec rm -rf {} +
+          rm -rf data/logs
+          touch .gitignore
+          for line in ".env" "__pycache__/" "*.pyc" "data/logs/"; do
+            grep -qxF "$line" .gitignore || echo "$line" >> .gitignore
+          done
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Nothing to commit."
+          else
+            git commit -m "Auto-unzip uploaded archive"
+            git push
+          fi￼Enter
