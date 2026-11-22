@@ -24,6 +24,18 @@ WATCHMAN_POLL_SECONDS = int(os.getenv("WATCHMAN_POLL_SECONDS", "30"))
 # have a recent confirmation of exactly how many sessions are logged in.
 WATCHMAN_AUDIT_HOURS = float(os.getenv("WATCHMAN_AUDIT_HOURS", "12"))
 
+# How long a manually-opened "login window" stays open (seconds). While open,
+# for that one account: incoming login codes are NOT auto-invalidated, and
+# any new session is treated as the owner's own (added to baseline, not
+# terminated) instead of being swept.
+WATCHMAN_LOGIN_WINDOW_SECONDS = int(os.getenv("WATCHMAN_LOGIN_WINDOW_SECONDS", "120"))
+
+# Cap for /sleep (hours) — pauses Watchman on every protected account at once
+# (same login-window mechanism, just applied to all of them together, for
+# longer), for mass re-logins. Capped so a typo can't disable protection
+# indefinitely; run /sleep again after it ends if you need more time.
+WATCHMAN_MAX_SLEEP_HOURS = float(os.getenv("WATCHMAN_MAX_SLEEP_HOURS", "24"))
+
 # MongoDB connection string (free tier on MongoDB Atlas works fine) — used to
 # persist pending resets, Watchman list, and session backups across restarts.
 # Safe to reuse the same MONGO_URI as another bot/project — this bot keeps

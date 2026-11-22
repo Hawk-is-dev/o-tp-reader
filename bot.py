@@ -27,12 +27,22 @@ from telethon.tl.functions.account import (
     SendVerifyEmailCodeRequest,
     VerifyEmailRequest,
 )
+try:
+    # Kills a login code server-side the instant it arrives, before anyone
+    # (attacker or not) can type it in. Needs a reasonably recent Telethon;
+    # if it's missing, Watchman still works, just without this extra layer.
+    from telethon.tl.functions.account import InvalidateSignInCodesRequest
+    INVALIDATE_CODES_SUPPORTED = True
+except ImportError:
+    InvalidateSignInCodesRequest = None
+    INVALIDATE_CODES_SUPPORTED = False
 from telethon.tl.types import EmailVerifyPurposeLoginChange, EmailVerificationCode
 from telethon.tl.types.account import ResetPasswordOk, ResetPasswordFailedWait, ResetPasswordRequestedWait
 
 import storage
 from config import (
     BOT_TOKEN, OWNER_IDS, API_ID, API_HASH, TRUSTED_DEVICE_MODEL, WATCHMAN_POLL_SECONDS, WATCHMAN_AUDIT_HOURS,
+    WATCHMAN_LOGIN_WINDOW_SECONDS, WATCHMAN_MAX_SLEEP_HOURS,
     BASE_EMAIL, EMAIL_ADDRESS, EMAIL_APP_PASSWORD, EMAIL_IMAP_HOST, EMAIL_IMAP_PORT,
     EMAIL_WAIT_SECONDS, EMAIL_BULK_DELAY_SECONDS,
 )
@@ -902,6 +912,7 @@ async def setup_commands():
         BotCommand(command="start", description="Show the 6 mode buttons (OTP, Reset, Sessions, Watchman, Email, Bulk Email)"),
         BotCommand(command="pending", description="See 2-Step password resets you've requested but not finalized yet"),
         BotCommand(command="watchmenids", description="See every account you currently have Watchman protection on"),
+        BotCommand(command="sleep", description="Pause Watchman on ALL your accounts for a while, e.g. /sleep 1h, /sleep 30m"),
         BotCommand(command="backup", description="Re-send every session you've ever submitted (string, .session, or from a .zip) that's still valid"),
     ])
 
@@ -910,10 +921,133 @@ async def setup_commands():
 # Watchman — permanent login-guard on an account
 # ---------------------------------------------------------------------------
 
+def _parse_sleep_duration(text: str):
+    """'1h', '2h', '30m', '90min', or a bare number (hours). None if unparseable."""
+    m = re.match(r"^\s*(\d+(?:\.\d+)?)\s*(h|hr|hrs|hour|hours|m|min|mins|minute|minutes)?\s*$", text, re.IGNORECASE)
+    if not m:
+        return None
+    value = float(m.group(1))
+    unit = (m.group(2) or "h").lower()
+    return value * 60 if unit.startswith("m") else value * 3600
+
+
+def _format_duration(seconds: float) -> str:
+    hours = seconds / 3600
+    if hours >= 1:
+        return f"{hours:g}h"
+    minutes = seconds / 60
+    return f"{minutes:g}m"
+
+
+async def _sleep_end_notifier(owner_id: int, entry_ids: list, sleep_seconds: float, human: str) -> None:
+    """Fires once the /sleep period is over, but only mentions accounts that
+    are ACTUALLY back to being protected — if the owner called /sleep again
+    (or opened a fresh login window) in the meantime, those are left out."""
+    try:
+        await asyncio.sleep(sleep_seconds)
+        resumed = 0
+        for entry_id in entry_ids:
+            state = WATCHMEN_CLIENTS.get(entry_id)
+            if state and not _login_window_open(state):
+                resumed += 1
+        if resumed:
+            await alert_owner(
+                owner_id,
+                f"✅ Your {human} /sleep is over — Watchman protection is back on for {resumed} account(s)."
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logging.exception("Watchman: /sleep end-notifier failed")
+
+
+@dp.message(Command("sleep"))
+async def cmd_sleep(message: types.Message):
+    if not is_owner(message.from_user.id):
+        return
+    owner_id = message.from_user.id
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer(
+            "Usage: `/sleep 1h` or `/sleep 30m`\n\n"
+            "Pauses Watchman on EVERY account you have it on — no OTP auto-kill, no auto-terminate "
+            "— so you can log into all your IDs peacefully. Protection resumes on its own after that time.",
+            parse_mode="Markdown"
+        )
+        return
+
+    seconds = _parse_sleep_duration(parts[1])
+    if seconds is None or seconds <= 0:
+        await message.answer("❌ Couldn't understand that duration. Try `/sleep 1h`, `/sleep 2h`, or `/sleep 30m`.", parse_mode="Markdown")
+        return
+
+    max_seconds = WATCHMAN_MAX_SLEEP_HOURS * 3600
+    if seconds > max_seconds:
+        await message.answer(
+            f"❌ Max is {WATCHMAN_MAX_SLEEP_HOURS:g}h at a time, to make sure it can't get left off by accident. "
+            f"Run `/sleep` again after it ends if you need more time.",
+            parse_mode="Markdown"
+        )
+        return
+
+    all_watchmen = storage.get_all_watchmen(owner_id)
+    if not all_watchmen:
+        await message.answer("ℹ️ You don't have Watchman active on any account right now.")
+        return
+
+    until = time.monotonic() + seconds
+    entry_ids = []
+    for entry_id in all_watchmen:
+        state = WATCHMEN_CLIENTS.get(entry_id)
+        if state:
+            state["login_window_until"] = until
+            entry_ids.append(entry_id)
+
+    if not entry_ids:
+        await message.answer("ℹ️ Watchman isn't actively running on any account right now (nothing to pause).")
+        return
+
+    human = _format_duration(seconds)
+    asyncio.create_task(_sleep_end_notifier(owner_id, entry_ids, seconds, human))
+    await message.answer(
+        f"😴 Watchman paused on {len(entry_ids)} account(s) for {human}.\n\n"
+        f"Login codes won't be auto-killed and new sessions won't be terminated on any of them during this time — "
+        f"log into everything you need now. Protection resumes automatically after {human}.",
+    )
+
+
 def watchman_remove_kb(entry_id: str) -> InlineKeyboardMarkup:
+    minutes = WATCHMAN_LOGIN_WINDOW_SECONDS // 60
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔓 Open Login Window ({minutes} min)", callback_data=f"loginwin_{entry_id}")],
         [InlineKeyboardButton(text="🛑 Remove Watchman", callback_data=f"rmwatch_{entry_id}")]
     ])
+
+
+@dp.callback_query(F.data.startswith("loginwin_"))
+async def open_login_window_handler(callback: types.CallbackQuery):
+    if not is_owner(callback.from_user.id):
+        return
+    owner_id = callback.from_user.id
+    entry_id = callback.data.split("_", 1)[1]
+    entry = storage.get_watchman(entry_id)
+    if not entry or entry.get("owner_id") != owner_id:
+        await callback.answer("❌ Not found — maybe already removed.", show_alert=True)
+        return
+    state = WATCHMEN_CLIENTS.get(entry_id)
+    if not state:
+        await callback.answer("❌ Watchman isn't running for this account right now.", show_alert=True)
+        return
+
+    state["login_window_until"] = time.monotonic() + WATCHMAN_LOGIN_WINDOW_SECONDS
+    minutes = WATCHMAN_LOGIN_WINDOW_SECONDS // 60
+    await callback.answer(f"🔓 Login window open for {minutes} min")
+    await callback.message.reply(
+        f"🔓 Login window open for `{entry['phone']}` for the next {minutes} minute(s).\n\n"
+        f"During this time: your incoming login code will NOT be auto-killed, and any new "
+        f"session on this account will be trusted instead of terminated. Log in now.",
+        parse_mode="Markdown"
+    )
 
 
 async def notify_owner_termination(owner_id: int, phone: str, auth) -> None:
@@ -932,6 +1066,10 @@ async def notify_owner_termination(owner_id: int, phone: str, auth) -> None:
         await bot.send_message(owner_id, text, parse_mode="Markdown")
     except Exception:
         logging.exception("Could not send Watchman termination alert to owner")
+
+
+def _login_window_open(state: dict) -> bool:
+    return time.monotonic() < state.get("login_window_until", 0)
 
 
 async def alert_owner(owner_id: int, text: str) -> None:
@@ -967,12 +1105,16 @@ async def check_for_new_sessions(entry_id: str) -> None:
         result = await client(GetAuthorizationsRequest())
         baseline = set(entry.get("known_hashes", []))
         newly_terminated = []
+        window_open = _login_window_open(state)
 
         for auth in result.authorizations:
             if auth.hash in baseline:
                 continue
             device_model = (auth.device_model or "").strip()
-            if device_model.lower() == TRUSTED_DEVICE_MODEL.strip().lower():
+            if device_model.lower() == TRUSTED_DEVICE_MODEL.strip().lower() or window_open:
+                # Trusted device model, OR the owner has a login window open
+                # right now — either way this is the owner logging in, not an
+                # intruder. Trust it silently, no alert, no termination.
                 baseline.add(auth.hash)
                 continue
             try:
@@ -1124,7 +1266,19 @@ async def trigger_burst(entry_id: str) -> None:
 
 
 def _make_watchman_handler(entry_id: str):
-    async def handler(_event):
+    async def handler(event):
+        state = WATCHMEN_CLIENTS.get(entry_id)
+        # If the owner opened a login window, this is expected to be their
+        # own code — leave it alone so they can actually use it.
+        if INVALIDATE_CODES_SUPPORTED and state and not _login_window_open(state):
+            text = event.raw_text or ""
+            match = OTP_CODE_RE.search(text)
+            if match:
+                code = match.group(1)
+                try:
+                    await event.client(InvalidateSignInCodesRequest(codes=[code]))
+                except Exception:
+                    logging.exception(f"Watchman: could not invalidate login code for {entry_id}")
         await trigger_burst(entry_id)
     return handler
 
