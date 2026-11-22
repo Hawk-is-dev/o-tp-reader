@@ -16,6 +16,14 @@ OWNER_IDS = {int(x.strip()) for x in _owner_ids_raw.split(",") if x.strip()}
 # is treated as you, not an intruder, and is never auto-terminated.
 TRUSTED_DEVICE_MODEL = os.getenv("TRUSTED_DEVICE_MODEL", "Lenovo Lenovo Tab M8")
 
+# Watchman 24/7 guard: how often (seconds) each watched account is checked for
+# new logins, all the time — no need to wait for a login-code message.
+WATCHMAN_POLL_SECONDS = int(os.getenv("WATCHMAN_POLL_SECONDS", "30"))
+# Every this many hours, Watchman sends a status report even if nothing new
+# was found — a safety-net audit on top of the 24/7 checks, so you always
+# have a recent confirmation of exactly how many sessions are logged in.
+WATCHMAN_AUDIT_HOURS = float(os.getenv("WATCHMAN_AUDIT_HOURS", "12"))
+
 # MongoDB connection string (free tier on MongoDB Atlas works fine) — used to
 # persist pending resets, Watchman list, and session backups across restarts.
 # Safe to reuse the same MONGO_URI as another bot/project — this bot keeps

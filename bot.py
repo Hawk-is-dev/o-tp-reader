@@ -8,6 +8,7 @@ import sqlite3
 import tempfile
 import time
 import uuid
+import time
 from datetime import datetime, timezone
 
 from aiogram import Bot, Dispatcher, F, types
@@ -31,7 +32,7 @@ from telethon.tl.types.account import ResetPasswordOk, ResetPasswordFailedWait, 
 
 import storage
 from config import (
-    BOT_TOKEN, OWNER_IDS, API_ID, API_HASH, TRUSTED_DEVICE_MODEL,
+    BOT_TOKEN, OWNER_IDS, API_ID, API_HASH, TRUSTED_DEVICE_MODEL, WATCHMAN_POLL_SECONDS, WATCHMAN_AUDIT_HOURS,
     BASE_EMAIL, EMAIL_ADDRESS, EMAIL_APP_PASSWORD, EMAIL_IMAP_HOST, EMAIL_IMAP_PORT,
     EMAIL_WAIT_SECONDS, EMAIL_BULK_DELAY_SECONDS,
 )
@@ -69,7 +70,7 @@ class EmailChangeState(StatesGroup):
 WATCHMEN_CLIENTS = {}
 
 BURST_WINDOW_SECONDS = 15 * 60
-BURST_CHECK_INTERVAL = 25
+BURST_CHECK_INTERVAL = 5  # fast polling right after a login-code message
 
 # In-memory batch state for the current .zip run — keyed by owner_id, so
 # two different owners running batches at the same time never collide.
@@ -332,14 +333,15 @@ async def process_single_session(message: types.Message, session_string: str, pr
         return
 
     if mode == "watchman":
-        entry_id, error = await activate_watchman(owner_id, session_string, phone)
+        entry_id, error, session_count = await activate_watchman(owner_id, session_string, phone)
         if error:
             await status.edit_text(f"❌ Could not activate Watchman for `{phone}`.\n\nReason: {error}", parse_mode="Markdown")
             return
         await status.edit_text(
             f"👁️ Watchman activated for `{phone}`.\n\n"
+            f"📊 Currently logged in: {session_count} session(s) — all marked trusted right now.\n\n"
             f"Any new login (other than your trusted device) will be terminated automatically. "
-            f"Existing sessions are left untouched.",
+            f"Existing sessions are left untouched. A status audit is sent every {WATCHMAN_AUDIT_HOURS:g}h.",
             parse_mode="Markdown",
             reply_markup=watchman_remove_kb(entry_id)
         )
@@ -494,13 +496,14 @@ async def process_zip_immediate(owner_id: int, chat_id: int, items: list, mode: 
             await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=kb)
 
         elif mode == "watchman":
-            entry_id, error = await activate_watchman(owner_id, item["session"], phone)
+            entry_id, error, session_count = await activate_watchman(owner_id, item["session"], phone)
             if error:
                 await bot.send_message(chat_id, f"❌ Could not activate Watchman for `{phone}`.\n\nReason: {error}", parse_mode="Markdown")
                 continue
             await bot.send_message(
                 chat_id,
                 f"👁️ Watchman activated for `{phone}`.\n\n"
+                f"📊 Currently logged in: {session_count} session(s) — all marked trusted right now.\n\n"
                 f"Any new login (other than your trusted device) will be terminated automatically.",
                 parse_mode="Markdown",
                 reply_markup=watchman_remove_kb(entry_id)
@@ -931,42 +934,165 @@ async def notify_owner_termination(owner_id: int, phone: str, auth) -> None:
         logging.exception("Could not send Watchman termination alert to owner")
 
 
+async def alert_owner(owner_id: int, text: str) -> None:
+    """Plain-text alert to the owner (no Markdown, so it can never fail to parse)."""
+    try:
+        await bot.send_message(owner_id, text)
+    except Exception:
+        logging.exception("Could not send Watchman alert to owner")
+
+
 async def check_for_new_sessions(entry_id: str) -> None:
     """One pass: compares the account's current authorizations against the
     known baseline. A brand-new one is terminated and reported, UNLESS its
     device model matches TRUSTED_DEVICE_MODEL (that's just the owner
     logging in themselves) — trusted logins are added to the baseline
-    silently and left alone."""
+    silently and left alone.
+
+    Errors from Telegram (network, logged-out session) are NOT swallowed
+    here — they propagate to watchman_loop, which alerts the owner.
+    A failed terminate IS caught per-session and the owner is alerted."""
     state = WATCHMEN_CLIENTS.get(entry_id)
     if not state:
         return
-    entry = storage.get_watchman(entry_id)
-    if not entry:
-        return
 
-    client = state["client"]
-    result = await client(GetAuthorizationsRequest())
-    baseline = set(entry.get("known_hashes", []))
-    newly_terminated = []
+    # The 24/7 loop and the burst monitor can overlap — serialize them so one
+    # new session is never terminated / reported twice.
+    async with state["lock"]:
+        entry = storage.get_watchman(entry_id)
+        if not entry:
+            return
 
-    for auth in result.authorizations:
-        if auth.hash in baseline:
-            continue
-        device_model = (auth.device_model or "").strip()
-        if device_model.lower() == TRUSTED_DEVICE_MODEL.strip().lower():
-            baseline.add(auth.hash)
-            continue
-        try:
-            await client(ResetAuthorizationRequest(hash=auth.hash))
-            baseline.add(auth.hash)
-            newly_terminated.append(auth)
-        except Exception:
-            logging.exception(f"Watchman: failed to terminate a new session for {entry_id}")
+        client = state["client"]
+        result = await client(GetAuthorizationsRequest())
+        baseline = set(entry.get("known_hashes", []))
+        newly_terminated = []
 
-    storage.update_watchman_known_hashes(entry_id, list(baseline))
+        for auth in result.authorizations:
+            if auth.hash in baseline:
+                continue
+            device_model = (auth.device_model or "").strip()
+            if device_model.lower() == TRUSTED_DEVICE_MODEL.strip().lower():
+                baseline.add(auth.hash)
+                continue
+            try:
+                await client(ResetAuthorizationRequest(hash=auth.hash))
+                baseline.add(auth.hash)
+                newly_terminated.append(auth)
+            except Exception as e:
+                if "HashInvalid" in type(e).__name__:
+                    # Already gone by the time we tried — nothing to do.
+                    baseline.add(auth.hash)
+                    continue
+                logging.exception(f"Watchman: failed to terminate a new session for {entry_id}")
+                alerted = state.setdefault("fail_alerted", set())
+                if auth.hash not in alerted:
+                    alerted.add(auth.hash)
+                    await alert_owner(
+                        entry["owner_id"],
+                        f"⚠️ Watchman FOUND a new login on {entry['phone']} but could NOT terminate it!\n\n"
+                        f"Reason: {type(e).__name__}: {e}\n\n"
+                        f"• Device: {auth.device_model or 'Unknown'}\n"
+                        f"• App: {auth.app_name or 'Unknown'} {auth.app_version or ''}\n"
+                        f"• Location: {auth.country or 'Unknown'}\n"
+                        f"• IP: {auth.ip or 'Unknown'}\n"
+                        f"• Logged in at: {auth.date_created}\n\n"
+                        f"Terminate it manually now. I will keep retrying."
+                    )
+
+        storage.update_watchman_known_hashes(entry_id, list(baseline))
+        total_sessions = len(result.authorizations)
 
     for auth in newly_terminated:
         await notify_owner_termination(entry["owner_id"], entry["phone"], auth)
+
+    return total_sessions
+
+
+_DEAD_SESSION_ERRORS = {
+    "AuthKeyUnregisteredError", "SessionRevokedError", "SessionExpiredError",
+    "UserDeactivatedError", "UserDeactivatedBanError", "AuthKeyDuplicatedError",
+}
+
+
+async def _watchman_dead(entry_id: str, entry: dict, reason: str) -> None:
+    """The watched session itself is gone (logged out / banned). Nothing more
+    can be guarded — tell the owner loudly and stop the loop. The entry stays
+    in storage so /watchmenids can still show it and offer Remove."""
+    state = WATCHMEN_CLIENTS.pop(entry_id, None)
+    if state:
+        burst_task = state.get("burst_task")
+        if burst_task and not burst_task.done():
+            burst_task.cancel()
+        try:
+            await state["client"].disconnect()
+        except Exception:
+            pass
+    await alert_owner(
+        entry["owner_id"],
+        f"🚨 Watchman STOPPED for {entry['phone']} — it is NOT protected anymore!\n\n"
+        f"Reason: {reason}\n\n"
+        f"The Watchman session was logged out or banned. Remove it from /watchmenids "
+        f"and activate Watchman again with a fresh session."
+    )
+
+
+async def watchman_loop(entry_id: str) -> None:
+    """24/7 guard for one account. Checks immediately (so anything that logged
+    in while the bot was down is caught on startup), then every
+    WATCHMAN_POLL_SECONDS forever — it does not wait for a login-code message.
+    Reconnects on its own, and tells the owner if it keeps failing."""
+    fails = 0
+    alerted_down = False
+    last_audit_ts = time.monotonic()
+    audit_interval = WATCHMAN_AUDIT_HOURS * 3600
+    while True:
+        state = WATCHMEN_CLIENTS.get(entry_id)
+        if not state:
+            return  # removed / stopped
+        entry = storage.get_watchman(entry_id)
+        if not entry:
+            return
+        client = state["client"]
+        try:
+            if not client.is_connected():
+                await client.connect()
+            if not await client.is_user_authorized():
+                await _watchman_dead(entry_id, entry, "session is no longer authorized")
+                return
+            session_count = await check_for_new_sessions(entry_id)
+            if alerted_down:
+                await alert_owner(entry["owner_id"], f"✅ Watchman is back to normal for {entry['phone']}.")
+            fails = 0
+            alerted_down = False
+
+            now = time.monotonic()
+            if now - last_audit_ts >= audit_interval:
+                last_audit_ts = now
+                await alert_owner(
+                    entry["owner_id"],
+                    f"🛡️ Watchman audit for {entry['phone']}:\n\n"
+                    f"• Currently logged in: {session_count} session(s)\n"
+                    f"• All accounted for, nothing unknown right now.\n"
+                    f"• Still checking every {WATCHMAN_POLL_SECONDS}s, 24/7.\n\n"
+                    f"Next audit in ~{WATCHMAN_AUDIT_HOURS:g}h."
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if type(e).__name__ in _DEAD_SESSION_ERRORS:
+                await _watchman_dead(entry_id, entry, f"{type(e).__name__}")
+                return
+            fails += 1
+            logging.exception(f"Watchman: check failed for {entry_id} (attempt {fails})")
+            if fails >= 3 and not alerted_down:
+                alerted_down = True
+                await alert_owner(
+                    entry["owner_id"],
+                    f"⚠️ Watchman cannot check {entry['phone']} right now ({type(e).__name__}). "
+                    f"It keeps retrying every {WATCHMAN_POLL_SECONDS}s and will tell you when it recovers."
+                )
+        await asyncio.sleep(WATCHMAN_POLL_SECONDS)
 
 
 async def burst_monitor(entry_id: str) -> None:
@@ -1103,6 +1229,7 @@ async def bulk_email_change_one(chat_id: int, name: str, phone: str, session_str
 
 
 async def activate_watchman(owner_id: int, session_string: str, phone: str):
+    # Returns (entry_id, error, session_count).
     """Connects and stays connected — Watchman is the one feature in this
     bot that's deliberately NOT on-demand, since it has to be listening at
     all times to react to a login attempt. Returns (entry_id, error)."""
@@ -1111,7 +1238,7 @@ async def activate_watchman(owner_id: int, session_string: str, phone: str):
         await client.connect()
         if not await client.is_user_authorized():
             await client.disconnect()
-            return None, "Session is not authorized (logged out or invalid)."
+            return None, "Session is not authorized (logged out or invalid).", 0
         result = await client(GetAuthorizationsRequest())
         baseline_hashes = [a.hash for a in result.authorizations]
     except Exception as e:
@@ -1119,14 +1246,15 @@ async def activate_watchman(owner_id: int, session_string: str, phone: str):
             await client.disconnect()
         except Exception:
             pass
-        return None, str(e)
+        return None, str(e), 0
 
     entry_id = f"watch_{uuid.uuid4().hex[:10]}"
     storage.add_watchman(owner_id, entry_id, phone, session_string, baseline_hashes)
 
     client.add_event_handler(_make_watchman_handler(entry_id), events.NewMessage(from_users=TELEGRAM_SERVICE_ID))
-    WATCHMEN_CLIENTS[entry_id] = {"client": client, "burst_task": None}
-    return entry_id, None
+    WATCHMEN_CLIENTS[entry_id] = {"client": client, "burst_task": None, "lock": asyncio.Lock()}
+    WATCHMEN_CLIENTS[entry_id]["loop_task"] = asyncio.create_task(watchman_loop(entry_id))
+    return entry_id, None, len(baseline_hashes)
 
 
 async def stop_watchman(owner_id: int, entry_id: str) -> None:
@@ -1137,6 +1265,9 @@ async def stop_watchman(owner_id: int, entry_id: str) -> None:
         burst_task = state.get("burst_task")
         if burst_task and not burst_task.done():
             burst_task.cancel()
+        loop_task = state.get("loop_task")
+        if loop_task and not loop_task.done():
+            loop_task.cancel()
         try:
             await state["client"].disconnect()
         except Exception:
@@ -1177,21 +1308,20 @@ async def cmd_watchmenids(message: types.Message):
 
 
 async def restore_watchmen() -> None:
-    """Called once at startup — reconnects every Watchman that was active
-    before the last restart, from the persistent store."""
+    """Called once at startup — brings back every Watchman that was active
+    before the last restart, from the persistent store. Each one gets its own
+    24/7 loop, which connects (retrying if the network is down), checks right
+    away for any login that happened while the bot was off, and keeps going."""
     all_watchmen = storage.get_all_watchmen_every_owner()
     for entry_id, entry in all_watchmen.items():
-        client = TelegramClient(StringSession(entry["session"]), API_ID, API_HASH)
         try:
-            await client.connect()
-            if not await client.is_user_authorized():
-                logging.warning(f"Watchman {entry_id} ({entry['phone']}) session no longer authorized — skipping restore.")
-                await client.disconnect()
-                continue
+            client = TelegramClient(StringSession(entry["session"]), API_ID, API_HASH)
             client.add_event_handler(_make_watchman_handler(entry_id), events.NewMessage(from_users=TELEGRAM_SERVICE_ID))
-            WATCHMEN_CLIENTS[entry_id] = {"client": client, "burst_task": None}
+            WATCHMEN_CLIENTS[entry_id] = {"client": client, "burst_task": None, "lock": asyncio.Lock()}
+            WATCHMEN_CLIENTS[entry_id]["loop_task"] = asyncio.create_task(watchman_loop(entry_id))
         except Exception:
             logging.exception(f"Could not restore Watchman {entry_id} ({entry.get('phone')})")
+            await alert_owner(entry["owner_id"], f"⚠️ Could not restore Watchman for {entry.get('phone')} at startup — check the logs.")
 
 
 # ---------------------------------------------------------------------------
